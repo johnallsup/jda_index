@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import sqlite3
+import subprocess
+import re
+import time
+import platform
+import shutil
+from pathlib import Path
+from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QLineEdit, 
+                             QTableWidget, QTableWidgetItem, QWidget, QLabel, 
+                             QHeaderView, QMenu, QInputDialog)
+from PySide6.QtGui import QAction, QCursor, QColor
+from PySide6.QtCore import Qt, QTimer
+
+# --- OS Detection and Command Mapping ---
+class OSHandler:
+    def __init__(self):
+        self.os_type = platform.system()
+
+    def open_file(self, path):
+        if self.os_type == "Linux":
+            subprocess.Popen(["xdg-open", path])
+        elif self.os_type == "Darwin":
+            subprocess.Popen(["open", path])
+        elif self.os_type == "Windows":
+            os.startfile(path)
+
+    def open_in_explorer(self, path):
+        if self.os_type == "Linux":
+            subprocess.Popen(["dolphin", "--select", path])
+        elif self.os_type == "Darwin":
+            subprocess.Popen(["open", "-R", path])
+        elif self.os_type == "Windows":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+
+    def open_terminal(self, path):
+        if self.os_type == "Linux":
+            for term in ["konsole", "gnome-terminal", "xfce4-terminal"]:
+                if shutil.which(term):
+                    cmd = [term, "--workdir" if term == "konsole" else "--working-directory", path]
+                    subprocess.Popen(cmd)
+                    return
+        elif self.os_type == "Darwin":
+            subprocess.Popen(["open", "-a", "Terminal", path])
+        elif self.os_type == "Windows":
+            subprocess.Popen(["cmd", "/K", f"cd /d {path}"], creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+# --- Utility Parsers ---
+TIME_MAP = {'m': 60, 'h': 3600, 'd': 86400, 'M': 2592000, 'y': 31536000}
+SIZE_MAP = {'k': 1024, 'm': 1024**2, 'g': 1024**3}
+
+def parse_range(raw_str, mapping):
+    try:
+        def to_val(s):
+            if not s: return None
+            num = float(re.sub(r'[a-zA-Z]', '', s))
+            suffix = re.sub(r'[0-9.]', '', s) or ' '
+            return num * mapping.get(suffix[0], 1)
+        if '-' in raw_str and not raw_str.startswith('-'):
+            parts = raw_str.split('-')
+            return to_val(parts[0]), to_val(parts[1])
+        return (None, to_val(raw_str[1:])) if raw_str.startswith('-') else (to_val(raw_str[1:]), None) if raw_str.startswith('+') else (to_val(raw_str), to_val(raw_str))
+    except: return None, None
+
+def regexp(expr, item, sensitive):
+    try:
+        flags = 0 if sensitive else re.IGNORECASE
+        return re.search(expr, item, flags) is not None
+    except: return False
+
+class JdaSearchWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.os_helper = OSHandler()
+        self.setWindowTitle(f"JdaSearch GUI ({self.os_helper.os_type})")
+        self.resize(1200, 800)
+        self.is_searching = False
+
+        # DB Path Resolution
+        system = platform.system()
+        if system == "Windows":
+            self.db_path = Path(os.environ.get("APPDATA", "~/AppData/Roaming")) / "JdaIndex/index.db"
+        elif system == "Darwin":
+            self.db_path = Path.home() / "Library/Application Support/JdaIndex/index.db"
+        else:
+            self.db_path = Path.home() / ".local/share/jda_index/index.db"
+        
+        # UI Setup
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        layout = QVBoxLayout(self.central_widget)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Query (e.g. Zebra2 -x -t fo -m -1d)")
+        self.search_input.setStyleSheet("font-size: 14px; padding: 10px; border: 1px solid #555;")
+        
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Type", "Size", "Modified", "Path"])
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.setAlternatingRowColors(True)
+        
+        self.status_label = QLabel("Ready")
+        
+        layout.addWidget(self.search_input)
+        layout.addWidget(self.table)
+        layout.addWidget(self.status_label)
+
+        # Timer for Debounce
+        self.timer = QTimer()
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(400) 
+        self.timer.timeout.connect(self.execute_search)
+        
+        # Signals
+        self.search_input.textChanged.connect(self.timer.start)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+        self.table.itemDoubleClicked.connect(self.handle_double_click)
+
+    def parse_gui_query(self, text):
+        parts = text.split()
+        if not parts: return None, {}
+        query = parts[0]
+        flags = {
+            "-i": False, "-e": None, "-s": None, "-m": None, 
+            "-t": None, "-l": False, "-n": False, 
+            "-x": False, "-X": False, "-r": False
+        }
+        i = 1
+        while i < len(parts):
+            p = parts[i]
+            if p == "-i": flags["-i"] = True
+            elif p == "-r": flags["-r"] = True
+            elif p == "-x": flags["-x"] = True
+            elif p == "-X": flags["-X"] = True
+            elif p == "-l": flags["-l"] = True
+            elif p == "-n": flags["-n"] = True
+            elif p in ["-e", "-s", "-m", "-t"] and i + 1 < len(parts):
+                flags[p] = parts[i+1]
+                i += 1
+            i += 1
+        return query, flags
+
+    def execute_search(self):
+        if self.is_searching:
+            self.timer.start(100)
+            return
+
+        full_text = self.search_input.text().strip()
+        if not full_text:
+            self.table.setRowCount(0)
+            self.status_label.setText("Ready")
+            return
+
+        if not self.db_path.exists():
+            self.status_label.setText("Error: Database not found. Run indexer first.")
+            return
+
+        self.is_searching = True
+        query_pattern, flags = self.parse_gui_query(full_text)
+        self.table.setRowCount(0)
+        
+        now = time.time()
+        conditions, params = [], []
+
+        # --- Path Matching Logic ---
+        if flags["-r"]:
+            conditions.append("regexp(?, path, ?)")
+            params.extend([query_pattern, int(not flags["-i"])])
+        elif flags["-X"]:
+            op = "LIKE" if flags["-i"] else "GLOB"
+            p1, p2 = (query_pattern, f"%/{query_pattern}") if flags["-i"] else (query_pattern, f"*/{query_pattern}")
+            conditions.append(f"(path {op} ? OR path {op} ?)")
+            params.extend([p1, p2])
+        elif flags["-x"]:
+            op = "LIKE" if flags["-i"] else "GLOB"
+            w = "%" if flags["-i"] else "*"
+            conditions.append(f"(path = ? OR path {op} ? OR path {op} ? OR path {op} ?)")
+            params.extend([query_pattern, f"{query_pattern}{w}/", f"{w}/{query_pattern}", f"{w}/{query_pattern}{w}/"])
+        else:
+            op = "LIKE" if flags["-i"] else "GLOB"
+            pattern = f"%{query_pattern}%" if flags["-i"] else f"*{query_pattern}*"
+            conditions.append(f"path {op} ?")
+            params.append(pattern)
+
+        # --- Filters ---
+        if flags["-l"]: conditions.append("is_link = 1")
+        elif flags["-n"]: conditions.append("is_link = 0")
+        if flags["-t"]:
+            t = flags["-t"].lower()
+            if t in ['f', 'file']: conditions.append("type = 'file'")
+            elif t in ['d', 'dir']: conditions.append("type = 'dir'")
+            elif t == 'link': conditions.append("is_link = 1")
+            elif t in ['fo', 'fileonly']: conditions.append("type = 'file' AND is_link = 0")
+            elif t in ['do', 'dironly']: conditions.append("type = 'dir' AND is_link = 0")
+
+        if flags["-e"]:
+            ext = flags["-e"] if flags["-e"].startswith(".") else f".{flags['-e']}"
+            conditions.append("ext = ?")
+            params.append(ext.lower())
+
+        if flags["-m"]:
+            t_hi, t_lo = parse_range(flags["-m"], TIME_MAP)
+            if t_lo: conditions.append("mtime <= ?"); params.append(now - t_lo)
+            if t_hi: conditions.append("mtime >= ?"); params.append(now - t_hi)
+        if flags["-s"]:
+            s_min, s_max = parse_range(flags["-s"], SIZE_MAP)
+            if s_min: conditions.append("size >= ?"); params.append(s_min)
+            if s_max: conditions.append("size <= ?"); params.append(s_max)
+
+        where_clause = " WHERE " + " AND ".join(conditions)
+        results_count = 0
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.create_function("regexp", 3, regexp)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'idx_%'")
+            tables = [r[0] for r in cursor.fetchall()]
+
+            for table in tables:
+                sql = f"SELECT path, size, mtime, type, is_link FROM {table} {where_clause} LIMIT 1000"
+                cursor.execute(sql, params)
+                for path, size, mtime, ftype, is_link in cursor.fetchall():
+                    row = self.table.rowCount()
+                    self.table.insertRow(row)
+                    
+                    type_str = "LINK" if is_link else ftype.upper()
+                    type_item = QTableWidgetItem(type_str)
+                    if is_link: type_item.setForeground(QColor("#00ffff"))
+                    elif ftype == "dir": type_item.setForeground(QColor("#ffff00"))
+                    
+                    self.table.setItem(row, 0, type_item)
+                    self.table.setItem(row, 1, QTableWidgetItem(f"{size / 1024 / 1024:.2f} MB"))
+                    self.table.setItem(row, 2, QTableWidgetItem(time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))))
+                    self.table.setItem(row, 3, QTableWidgetItem(path))
+                    results_count += 1
+            conn.close()
+        except Exception as e:
+            print(f"Database Error: {e}")
+
+        self.status_label.setText(f"Found {results_count} results")
+        self.is_searching = False
+
+    def handle_double_click(self, item):
+        path = self.table.item(item.row(), 3).text()
+        self.os_helper.open_in_explorer(path)
+
+    def show_context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if not item: return
+        path = self.table.item(item.row(), 3).text()
+        is_dir = os.path.isdir(path)
+        
+        menu = QMenu()
+        open_act = menu.addAction("Open Default")
+        term_act = menu.addAction("Open Terminal Here")
+        menu.addSeparator()
+        copy_path_act = menu.addAction("Copy Path")
+        aput_act = menu.addAction("aput (Named Clip)...")
+        cput_act = menu.addAction("cput (Named Clip)...")
+
+        action = menu.exec(QCursor.pos())
+        if action == open_act: self.os_helper.open_file(path)
+        elif action == term_act:
+            target = path if is_dir else str(Path(path).parent)
+            self.os_helper.open_terminal(target)
+        elif action == copy_path_act: QApplication.clipboard().setText(path)
+        elif action in [aput_act, cput_act]: self.handle_put_command(path, "aput" if action == aput_act else "cput")
+
+    def handle_put_command(self, path, cmd):
+        clip_name, ok = QInputDialog.getText(self, f"{cmd} Dialog", "Enter clip name:")
+        if ok and clip_name:
+            try:
+                p = subprocess.Popen([cmd, clip_name], stdin=subprocess.PIPE, text=True)
+                p.communicate(input=path)
+            except Exception as e: self.status_label.setText(f"Error: {e}")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = JdaSearchWindow()
+    window.show()
+    sys.exit(app.exec())

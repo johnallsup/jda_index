@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+
+import os
+import sqlite3
+import argparse
+import time
+import platform
+from pathlib import Path
+
+class JdaIndexer:
+    def __init__(self, target_path):
+        self.target_path = Path(target_path).expanduser().resolve()
+        self.db_path = self._get_db_path()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        self.conn = sqlite3.connect(self.db_path)
+        self._prepare_db()
+
+    def _get_db_path(self):
+        system = platform.system()
+        if system == "Windows":
+            base = Path(os.environ.get("APPDATA", "~/AppData/Roaming")) / "JdaIndex"
+        elif system == "Darwin":
+            base = Path.home() / "Library/Application Support/JdaIndex"
+        else: # Linux / Other
+            base = Path.home() / ".local/share/jda_index"
+        return base / "index.db"
+
+    def _sanitize_table_name(self, path):
+        return "idx_" + str(path).replace("/", "_").replace("\\", "_").replace(":", "").strip("_")
+
+    def _prepare_db(self):
+        table_name = self._sanitize_table_name(self.target_path)
+        with self.conn:
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            self.conn.execute(f"""
+                CREATE TABLE {table_name} (
+                    path TEXT PRIMARY KEY,
+                    ext TEXT,
+                    size INTEGER,
+                    mtime REAL,
+                    type TEXT,
+                    is_link INTEGER
+                )
+            """)
+            self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_ext_{table_name} ON {table_name}(ext)")
+
+    def get_extension(self, filename):
+        filename = filename.lower()
+        parts = filename.split('.')
+        if len(parts) > 2 and parts[-1] in ['gz', 'bz2', 'xz', 'zip']:
+            return "." + ".".join(parts[-2:])
+        return Path(filename).suffix
+
+    def run_index(self):
+        table_name = self._sanitize_table_name(self.target_path)
+        print(f"Indexing {self.target_path} into {table_name}...")
+        batch = []
+        for root, dirs, files in os.walk(self.target_path):
+            for name, entry_type in ([(f, "file") for f in files] + [(d, "dir") for d in dirs]):
+                full_path = os.path.join(root, name)
+                try:
+                    st = os.lstat(full_path)
+                    is_link = 1 if os.path.islink(full_path) else 0
+                    ext = self.get_extension(name) if entry_type == "file" else ""
+                    batch.append((full_path, ext, st.st_size, st.st_mtime, entry_type, is_link))
+                except (OSError, PermissionError): continue
+
+                if len(batch) >= 2000:
+                    self.conn.executemany(f"INSERT OR REPLACE INTO {table_name} VALUES (?,?,?,?,?,?)", batch)
+                    self.conn.commit()
+                    batch = []
+        
+        if batch:
+            self.conn.executemany(f"INSERT OR REPLACE INTO {table_name} VALUES (?,?,?,?,?,?)", batch)
+            self.conn.commit()
+        print("Done.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path")
+    args = parser.parse_args()
+    JdaIndexer(args.path).run_index()

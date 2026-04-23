@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+import sqlite3
+import argparse
+import re
+import time
+import platform
+import os
+from pathlib import Path
+
+# --- Configuration & OS Paths ---
+def get_db_path():
+    system = platform.system()
+    if system == "Windows":
+        base = Path(os.environ.get("APPDATA", "~/AppData/Roaming")) / "JdaIndex"
+    elif system == "Darwin":
+        base = Path.home() / "Library/Application Support/JdaIndex"
+    else:  # Linux / XDG
+        base = Path.home() / ".local/share/jda_index"
+    return base / "index.db"
+
+# --- Utility Parsers ---
+TIME_MAP = {'m': 60, 'h': 3600, 'd': 86400, 'M': 2592000, 'y': 31536000}
+SIZE_MAP = {'k': 1024, 'm': 1024**2, 'g': 1024**3}
+
+def parse_range(raw_str, mapping):
+    try:
+        def to_val(s):
+            if not s: return None
+            s = s.strip()
+            num = float(re.sub(r'[a-zA-Z]', '', s))
+            suffix = re.sub(r'[0-9.]', '', s) or ' '
+            return num * mapping.get(suffix[0], 1)
+
+        if '-' in raw_str and not raw_str.startswith('-'):
+            parts = raw_str.split('-')
+            return to_val(parts[0]), to_val(parts[1])
+        elif raw_str.startswith('-'):
+            return None, to_val(raw_str[1:])
+        elif raw_str.startswith('+'):
+            return to_val(raw_str[1:]), None
+        return to_val(raw_str), to_val(raw_str)
+    except Exception:
+        return None, None
+
+def regexp(expr, item, sensitive):
+    flags = 0 if sensitive else re.IGNORECASE
+    try:
+        return re.search(expr, item, flags) is not None
+    except re.error:
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="JDA Search CLI")
+    parser.add_argument("query", nargs='?', default=".", help="Search pattern")
+    parser.add_argument("-b", "--bare", action="store_true", help="Print only paths (no type/size info)")
+    parser.add_argument("-r", "--regex", action="store_true", help="Use regex")
+    parser.add_argument("-i", "--insensitive", action="store_true", help="Case-insensitive")
+    parser.add_argument("-x", "--exact", action="store_true", help="Match entire path component")
+    parser.add_argument("-X", "--very-exact", action="store_true", help="Match only final name")
+    parser.add_argument("-e", "--extension", help="Match extension")
+    parser.add_argument("-m", "--mtime", help="Time range")
+    parser.add_argument("-s", "--size", help="Size range")
+    parser.add_argument("-t", "--type", help="Type filter")
+    parser.add_argument("-l", "--links", action="store_true", help="Symlinks only")
+    parser.add_argument("-n", "--no-links", action="store_true", help="Exclude symlinks")
+    
+    args = parser.parse_args()
+    db_path = get_db_path()
+
+    if not db_path.exists():
+        print(f"Error: Database not found at {db_path}.")
+        return
+
+    conn = sqlite3.connect(db_path)
+    conn.create_function("regexp", 3, regexp)
+    
+    now = time.time()
+    conditions, params = [], []
+
+    # Type/Link logic
+    if args.links: conditions.append("is_link = 1")
+    elif args.no_links: conditions.append("is_link = 0")
+    if args.type:
+        t = args.type.lower()
+        if t in ['f', 'file']: conditions.append("type = 'file'")
+        elif t in ['d', 'dir']: conditions.append("type = 'dir'")
+        elif t == 'link': conditions.append("is_link = 1")
+        elif t in ['fo', 'fileonly']: conditions.append("type = 'file' AND is_link = 0")
+        elif t in ['do', 'dironly']: conditions.append("type = 'dir' AND is_link = 0")
+
+    if args.extension:
+        ext = args.extension if args.extension.startswith(".") else f".{args.extension}"
+        conditions.append("ext = ?")
+        params.append(ext.lower())
+
+    # Path pattern matching
+    if args.regex:
+        conditions.append("regexp(?, path, ?)")
+        params.extend([args.query, int(not args.insensitive)])
+    elif args.very_exact:
+        op = "LIKE" if args.insensitive else "GLOB"
+        p1, p2 = (args.query, f"%/{args.query}") if args.insensitive else (args.query, f"*/{args.query}")
+        conditions.append(f"(path {op} ? OR path {op} ?)")
+        params.extend([p1, p2])
+    elif args.exact:
+        op = "LIKE" if args.insensitive else "GLOB"
+        w = "%" if args.insensitive else "*"
+        conditions.append(f"(path = ? OR path {op} ? OR path {op} ? OR path {op} ?)")
+        params.extend([args.query, f"{args.query}{w}/", f"{w}/{args.query}", f"{w}/{args.query}{w}/"])
+    else:
+        op = "LIKE" if args.insensitive else "GLOB"
+        pattern = f"%{args.query}%" if args.insensitive else f"*{args.query}*"
+        conditions.append(f"path {op} ?")
+        params.append(pattern)
+
+    if args.mtime:
+        hi, lo = parse_range(args.mtime, TIME_MAP)
+        if lo: conditions.append("mtime <= ?"); params.append(now - lo)
+        if hi: conditions.append("mtime >= ?"); params.append(now - hi)
+    if args.size:
+        s_min, s_max = parse_range(args.size, SIZE_MAP)
+        if s_min is not None: conditions.append("size >= ?"); params.append(s_min)
+        if s_max is not None: conditions.append("size <= ?"); params.append(s_max)
+
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'idx_%'")
+        tables = [r[0] for r in cursor.fetchall()]
+
+        for table in tables:
+            sql = f"SELECT path, size, type, is_link FROM {table}{where}"
+            for path, size, ftype, is_link in cursor.execute(sql, params):
+                if args.bare:
+                    print(path)
+                else:
+                    prefix = "L" if is_link else ("D" if ftype == "dir" else " ")
+                    size_str = f"{size / 1024 / 1024:>8.2f} MB"
+                    print(f"{prefix} {size_str} | {path}")
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()
